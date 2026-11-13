@@ -1,3 +1,4 @@
+use crate::surface_frame::SurfaceFrame;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
@@ -108,7 +109,7 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    surface: Option<wgpu::Surface<'static>>,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
@@ -449,7 +450,7 @@ impl WgpuRenderer {
         let resources = WgpuResources {
             device,
             queue,
-            surface,
+            surface: Some(surface),
             pipelines,
             bind_group_layouts,
             atlas_sampler,
@@ -982,9 +983,9 @@ impl WgpuRenderer {
                 texture.destroy();
             }
 
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &surface_config);
+            }
 
             // Invalidate intermediate textures - they will be lazily recreated
             // in draw() after we confirm the surface is healthy. This avoids
@@ -1040,9 +1041,9 @@ impl WgpuRenderer {
             let Some(resources) = self.resources.as_mut() else {
                 return;
             };
-            resources
-                .surface
-                .configure(&resources.device, &surface_config);
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &surface_config);
+            }
             resources.pipelines = Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1118,24 +1119,21 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self.resources().surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
-                return false;
-            }
+        let (frame, suboptimal) = match self
+            .resources()
+            .surface
+            .as_ref()
+            .expect("Configured surface missing")
+            .get_current_texture()
+        {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (SurfaceFrame::new(frame), false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (SurfaceFrame::new(frame), true),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
-                resources
-                    .surface
-                    .configure(&resources.device, &surface_config);
+                if let Some(surface) = &resources.surface {
+                    surface.configure(&resources.device, &surface_config);
+                }
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -1152,7 +1150,7 @@ impl WgpuRenderer {
         self.ensure_intermediate_textures();
 
         let frame_view = frame
-            .texture
+            .texture()
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let gamma_params = GammaParams {
@@ -1324,8 +1322,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
-                    return true;
+                    return self.present_frame(frame, suboptimal);
                 }
                 self.grow_instance_buffer();
                 continue;
@@ -1334,9 +1331,22 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
-            return true;
+            return self.present_frame(frame, suboptimal);
         }
+    }
+
+    fn present_frame(&mut self, frame: SurfaceFrame, suboptimal: bool) -> bool {
+        frame.present();
+        if self.device_lost() {
+            return false;
+        }
+        if suboptimal {
+            let resources = self.resources();
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &self.surface_config);
+            }
+        }
+        true
     }
 
     fn draw_quads(
@@ -1687,6 +1697,15 @@ impl WgpuRenderer {
         })
     }
 
+    /// Dropping the returned surface retires WSI presentation without discarding the atlas.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn take_surface_for_visibility(&mut self) -> Option<wgpu::Surface<'static>> {
+        self.surface_configured = false;
+        self.resources
+            .as_mut()
+            .and_then(|resources| resources.surface.take())
+    }
+
     /// Mark the surface as unconfigured so rendering is skipped until a new
     /// surface is provided via [`replace_surface`](Self::replace_surface).
     ///
@@ -1745,7 +1764,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.surface = surface;
+            res.surface = Some(surface);
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
